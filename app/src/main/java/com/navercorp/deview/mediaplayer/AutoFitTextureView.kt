@@ -48,50 +48,18 @@ class AutoFitTextureView @JvmOverloads constructor(
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val aspectRatio = ratioWidth.toFloat() / ratioHeight.toFloat()
-        var initialWidth = MeasureSpec.getSize(widthMeasureSpec)
-        var initialHeight = MeasureSpec.getSize(heightMeasureSpec)
-
-        val horizPadding = paddingLeft + paddingRight
-        val vertPadding = paddingTop + paddingBottom
-        initialWidth -= horizPadding
-        initialHeight -= vertPadding
-
-        val viewAspectRatio = initialWidth.toDouble() / initialHeight
-        val aspectDiff: Double = aspectRatio / viewAspectRatio - 1
-
-        // stay size if the difference of calculated aspect ratio is small enough from specific value
-
-        // stay size if the difference of calculated aspect ratio is small enough from specific value
-        if (Math.abs(aspectDiff) > 0.01) {
-            if (aspectDiff > 0) {
-                // adjust heght from width
-                initialHeight = (initialWidth / aspectRatio).toInt()
-            } else {
-                // adjust width from height
-                initialWidth = (initialHeight * aspectRatio).toInt()
-            }
-            initialWidth += horizPadding
-            initialHeight += vertPadding
-            val widthMeasureSpec = MeasureSpec.makeMeasureSpec(initialWidth, MeasureSpec.EXACTLY)
-            val heightMeasureSpec = MeasureSpec.makeMeasureSpec(initialHeight, MeasureSpec.EXACTLY)
-            super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+        val width = MeasureSpec.getSize(widthMeasureSpec)
+        val height = MeasureSpec.getSize(heightMeasureSpec)
+        if (ratioWidth == 0 || ratioHeight == 0) {
+            setMeasuredDimension(width, height)
         } else {
-            super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+            if (width < ((height * ratioWidth) / ratioHeight)) {
+                setMeasuredDimension(width, (width * ratioHeight) / ratioWidth)
+            } else {
+                setMeasuredDimension((height * ratioWidth) / ratioHeight, height)
+            }
         }
-
-//        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
-//        val width = View.MeasureSpec.getSize(widthMeasureSpec)
-//        val height = View.MeasureSpec.getSize(heightMeasureSpec)
-//        if (ratioWidth == 0 || ratioHeight == 0) {
-//            setMeasuredDimension(width, height)
-//        } else {
-//            if (width < ((height * ratioWidth) / ratioHeight)) {
-//                setMeasuredDimension(width, (width * ratioHeight) / ratioWidth)
-//            } else {
-//                setMeasuredDimension((height * ratioWidth) / ratioHeight, height)
-//            }
-//        }
     }
 
 }

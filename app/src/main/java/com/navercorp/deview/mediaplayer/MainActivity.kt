@@ -118,6 +118,8 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
             2 -> AudioFormat.CHANNEL_OUT_STEREO
             else -> error("AudioTrack doesn't support $channels channels")
         }
+        val minBufferSize = AudioTrack.getMinBufferSize(
+            sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
 
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(AudioAttributes.Builder()
@@ -129,7 +131,8 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
                 .setChannelMask(channelMask)
                 .build())
             .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(1024 * 100)
+            .setBufferSizeInBytes(minBufferSize * 10)
+            .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             .build()
     }
 
@@ -293,7 +296,20 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
         }, delayMillis)
     }
 
-    private fun postRenderAudio(audioFrame: AudioFrame, uptimeMillis: Long) {
+    private fun postRenderAudio(audioFrame: AudioFrame, delayMillis: Long) {
+        audioRenderHandler.postDelayed({
+            if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                audioTrack.play()
+            }
+
+            val size = audioFrame.data.remaining()
+            audioTrack.write(audioFrame.data, size, AudioTrack.WRITE_BLOCKING)
+
+            audioDecoder.releaseOutputBuffer(audioFrame.bufferId, false)
+        }, delayMillis)
+    }
+
+    private fun postRenderAudioAtTime(audioFrame: AudioFrame, uptimeMillis: Long) {
         audioRenderHandler.postAtTime({
             if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
                 audioTrack.play()
@@ -306,7 +322,13 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
         }, uptimeMillis)
     }
 
-    private fun postRenderVideo(videoFrame: VideoFrame, uptimeMillis: Long) {
+    private fun postRenderVideo(videoFrame: VideoFrame, delayMillis: Long) {
+        videoRenderHandler.postDelayed({
+            videoDecoder.releaseOutputBuffer(videoFrame.bufferId, true)
+        }, delayMillis)
+    }
+
+    private fun postRenderVideoAtTime(videoFrame: VideoFrame, uptimeMillis: Long) {
         videoRenderHandler.postAtTime({
             videoDecoder.releaseOutputBuffer(videoFrame.bufferId, true)
         }, uptimeMillis)
@@ -326,6 +348,8 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
 
     private fun postSyncAudioVideo(delayMillis: Long) {
         syncHandler.postDelayed({
+            val curTimeMs = SystemClock.uptimeMillis()
+
             val audioFrame: AudioFrame? = audioFrameQueue.peek()
             val videoFrame: VideoFrame? = videoFrameQueue.peek()
 
@@ -341,16 +365,20 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
                 }
 
                 val startPtsUs = min(audioFrame.ptsUs, videoFrame.ptsUs)
-                startTimeMs = SystemClock.uptimeMillis() - startPtsUs / 1000L
+                startTimeMs = curTimeMs - startPtsUs / 1000L
             }
 
             if (audioFrame != null) {
-                postRenderAudio(audioFrame, startTimeMs + audioFrame.ptsUs / 1000L)
+                val renderTimeMs = startTimeMs + audioFrame.ptsUs / 1000L
+                val delayMs = audioFrame.ptsUs / 1000L - (curTimeMs - startTimeMs)
+                postRenderAudioAtTime(audioFrame, renderTimeMs)
                 audioFrameQueue.remove()
             }
 
             if (videoFrame != null) {
-                postRenderVideo(videoFrame , startTimeMs + videoFrame.ptsUs / 1000L)
+                val renderTimeMs = startTimeMs + videoFrame.ptsUs / 1000L
+                val delayMs = videoFrame.ptsUs / 1000L - (curTimeMs - startTimeMs)
+                postRenderVideoAtTime(videoFrame , renderTimeMs)
                 videoFrameQueue.remove()
             }
 

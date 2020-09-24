@@ -5,12 +5,16 @@ import android.media.*
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.view.Surface
 import android.view.TextureView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.android.synthetic.main.activity_main.*
+import java.nio.ByteBuffer
+import java.util.*
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
+import kotlin.math.min
 
 // http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4
 private val MEDIA_FILE = "bbb_sunflower_1080p_30fps_normal.mp4"
@@ -64,7 +68,7 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
             avPlayer?.play()
         } else {
-            avPlayer?.stop()
+            //avPlayer?.stop()
             avPlayer?.release()
             avPlayer = null
         }
@@ -87,7 +91,6 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     private var videoOutEos = false
     private val audioBufferInfo = MediaCodec.BufferInfo()
     private val videoBufferInfo = MediaCodec.BufferInfo()
-    private var videoStartTimeUs = -1L
 
     init {
         val extractor = extractorSupplier()
@@ -126,13 +129,37 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
                 .setChannelMask(channelMask)
                 .build())
             .setTransferMode(AudioTrack.MODE_STREAM)
+            .setBufferSizeInBytes(1024 * 100)
             .build()
     }
 
     private val audioThread = HandlerThread("AudioThread").apply { start() }
     private val videoThread = HandlerThread("VideoThread").apply { start() }
+    private val syncThread = HandlerThread("SyncThread").apply { start() }
+    private val audioRenderThread = HandlerThread("AudioRenderThread").apply { start() }
+    private val videoRenderThread = HandlerThread("VideoRenderThread").apply { start() }
     private val audioHandler = Handler(audioThread.looper)
     private val videoHandler = Handler(videoThread.looper)
+    private val syncHandler = Handler(syncThread.looper)
+    private val audioRenderHandler = Handler(audioRenderThread.looper)
+    private val videoRenderHandler = Handler(videoRenderThread.looper)
+
+    private val audioFrameQueue: Queue<AudioFrame> = ConcurrentLinkedQueue<AudioFrame>()
+    private val videoFrameQueue: Queue<VideoFrame> = ConcurrentLinkedQueue<VideoFrame>()
+    private var startTimeMs = -1L
+
+    private data class AudioFrame(
+        val data: ByteBuffer,
+        val bufferId: Int,
+        val ptsUs: Long
+    ) {
+        override fun toString(): String = "AudioFrame(bufferId=$bufferId, ptsUs=$ptsUs)"
+    }
+
+    private data class VideoFrame(
+        val bufferId: Int,
+        val ptsUs: Long
+    )
 
     private fun createDecoder(extractor: MediaExtractor, trackIndex: Int, surface: Surface? = null): MediaCodec {
         val format = extractor.getTrackFormat(trackIndex)
@@ -152,28 +179,13 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
         videoExtractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
         audioDecoder.start()
         videoDecoder.start()
+        audioFrameQueue.clear()
+        videoFrameQueue.clear()
+        startTimeMs = -1L
         postExtractAudio(0)
         postExtractVideo(0)
         postDecodeAudio(0)
         postDecodeVideo(0)
-    }
-
-    fun stop() {
-        val latch = CountDownLatch(2)
-
-        audioHandler.postAtFrontOfQueue {
-            audioHandler.removeCallbacksAndMessages(null)
-            latch.countDown()
-        }
-        videoHandler.postAtFrontOfQueue {
-            videoHandler.removeCallbacksAndMessages(null)
-            latch.countDown()
-        }
-
-        latch.await()
-
-        audioDecoder.stop()
-        videoDecoder.stop()
     }
 
     private fun postExtractAudio(delayMillis: Long) {
@@ -215,18 +227,15 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
                             outputBuffer.position(audioBufferInfo.offset)
                             outputBuffer.limit(audioBufferInfo.offset + audioBufferInfo.size)
 
-                            if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
-                                audioTrack.play()
-                            }
-
-                            audioTrack.write(outputBuffer, audioBufferInfo.size, AudioTrack.WRITE_BLOCKING)
-                            audioDecoder.releaseOutputBuffer(outputIndex, false)
+                            queueAudio(outputBuffer, outputIndex,
+                                audioBufferInfo.presentationTimeUs)
                         }
                     }
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
                     MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
-                    else -> error("unexpected result from decoder.dequeueOutputBuffer: $outputIndex")
+                    else -> error("unexpected result from " +
+                            "decoder.dequeueOutputBuffer: $outputIndex")
                 }
 
                 postDecodeAudio(10)
@@ -269,23 +278,14 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
                             videoDecoder.releaseOutputBuffer(outputIndex, false)
                             videoOutEos = true
                         } else {
-                            val curTimeUs = System.nanoTime() / 1000L
-                            if (videoStartTimeUs < 0) {
-                                videoStartTimeUs = curTimeUs
-                            } else {
-                                val sleepTimeUs = videoBufferInfo.presentationTimeUs - (curTimeUs - videoStartTimeUs)
-                                if (sleepTimeUs > 0) {
-                                    TimeUnit.MICROSECONDS.sleep(sleepTimeUs)
-                                }
-                            }
-
-                            videoDecoder.releaseOutputBuffer(outputIndex, true)
+                            queueVideo(outputIndex, videoBufferInfo.presentationTimeUs)
                         }
                     }
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
                     MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
-                    else -> error("unexpected result from decoder.dequeueOutputBuffer: $outputIndex")
+                    else -> error("unexpected result from " +
+                            "decoder.dequeueOutputBuffer: $outputIndex")
                 }
 
                 postDecodeVideo(10)
@@ -293,8 +293,77 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
         }, delayMillis)
     }
 
+    private fun postRenderAudio(audioFrame: AudioFrame, uptimeMillis: Long) {
+        audioRenderHandler.postAtTime({
+            if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                audioTrack.play()
+            }
+
+            val size = audioFrame.data.remaining()
+            audioTrack.write(audioFrame.data, size, AudioTrack.WRITE_BLOCKING)
+
+            audioDecoder.releaseOutputBuffer(audioFrame.bufferId, false)
+        }, uptimeMillis)
+    }
+
+    private fun postRenderVideo(videoFrame: VideoFrame, uptimeMillis: Long) {
+        videoRenderHandler.postAtTime({
+            videoDecoder.releaseOutputBuffer(videoFrame.bufferId, true)
+        }, uptimeMillis)
+    }
+
+    private fun queueAudio(data: ByteBuffer, bufferId: Int, ptsUs: Long) {
+//        Log.d("TEST", "queueAudio: $bufferId, $ptsUs")
+        audioFrameQueue.add(AudioFrame(data, bufferId, ptsUs))
+        postSyncAudioVideo(0)
+    }
+
+    private fun queueVideo(bufferId: Int, ptsUs: Long) {
+//        Log.d("TEST", "queueVideo: $bufferId, $ptsUs")
+        videoFrameQueue.add(VideoFrame(bufferId, ptsUs))
+        postSyncAudioVideo(0)
+    }
+
+    private fun postSyncAudioVideo(delayMillis: Long) {
+        syncHandler.postDelayed({
+            val audioFrame: AudioFrame? = audioFrameQueue.peek()
+            val videoFrame: VideoFrame? = videoFrameQueue.peek()
+
+            if (audioFrame == null && videoFrame == null) {
+                return@postDelayed
+            }
+
+//            Log.d("TEST", "postSyncAudioVideo: audio=$audioFrame, video=$videoFrame")
+
+            if (startTimeMs < 0) {
+                if (audioFrame == null || videoFrame == null) {
+                    return@postDelayed
+                }
+
+                val startPtsUs = min(audioFrame.ptsUs, videoFrame.ptsUs)
+                startTimeMs = SystemClock.uptimeMillis() - startPtsUs / 1000L
+            }
+
+            if (audioFrame != null) {
+                postRenderAudio(audioFrame, startTimeMs + audioFrame.ptsUs / 1000L)
+                audioFrameQueue.remove()
+            }
+
+            if (videoFrame != null) {
+                postRenderVideo(videoFrame , startTimeMs + videoFrame.ptsUs / 1000L)
+                videoFrameQueue.remove()
+            }
+
+            if (!audioFrameQueue.isEmpty() || !videoFrameQueue.isEmpty()) {
+                postSyncAudioVideo(0)
+            } else {
+                postSyncAudioVideo(10)
+            }
+        }, delayMillis)
+    }
+
     fun release() {
-        val latch = CountDownLatch(2)
+        val latch = CountDownLatch(5)
 
         audioHandler.postAtFrontOfQueue {
             audioThread.quit()
@@ -304,8 +373,23 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
             videoThread.quit()
             latch.countDown()
         }
+        syncHandler.postAtFrontOfQueue {
+            syncThread.quit()
+            latch.countDown()
+        }
+        audioRenderHandler.postAtFrontOfQueue {
+            audioRenderThread.quit()
+            latch.countDown()
+        }
+        videoRenderHandler.postAtFrontOfQueue {
+            videoRenderThread.quit()
+            latch.countDown()
+        }
 
         latch.await()
+
+        audioFrameQueue.clear()
+        videoFrameQueue.clear()
 
         audioDecoder.stop()
         videoDecoder.stop()

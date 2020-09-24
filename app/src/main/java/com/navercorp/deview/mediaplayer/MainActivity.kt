@@ -7,6 +7,7 @@ import android.view.Surface
 import android.view.TextureView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.android.synthetic.main.activity_main.*
+import kotlin.concurrent.thread
 
 // http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4
 private val MEDIA_FILE = "bbb_sunflower_1080p_30fps_normal.mp4"
@@ -15,8 +16,8 @@ private val TIMEOUT_US = 10_000L
 class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     private lateinit var view: AutoFitTextureView
-    private lateinit var videoThread: VideoDecodeThread
-    private lateinit var audioThread: AudioDecodeThread
+
+    private lateinit var avPlayer: AVPlayer
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -26,22 +27,11 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         view.setAspectRatio(16, 9)
         view.surfaceTextureListener = this
 
-        val afd = assets.openFd(MEDIA_FILE)
-        val extractor = MediaExtractor().apply { setDataSource(afd) }
-
-        val videoTrackIndex = extractor.firstVideoTrack
-            ?: error("This media file doesn't contain any video tracks")
-        val videoExtractor = MediaExtractor().apply { setDataSource(afd) }
-
-        val audioTrackIndex = extractor.firstAudioTrack
-            ?: error("This media file doesn't contain any audio tracks")
-        val audioExtractor = MediaExtractor().apply { setDataSource(afd) }
-
-        afd.close()
-        extractor.release()
-
-        audioThread = AudioDecodeThread(audioExtractor, audioTrackIndex)
-        videoThread = VideoDecodeThread(videoExtractor, videoTrackIndex)
+        avPlayer = AVPlayer {
+            assets.openFd(MEDIA_FILE).use {
+                MediaExtractor().apply { setDataSource(it) }
+            }
+        }
     }
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
@@ -51,17 +41,13 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-        videoThread.setSurface(Surface(surface))
-        videoThread.start()
-        audioThread.start()
+        avPlayer.setSurface(Surface(surface))
+        avPlayer.start()
     }
 
 }
 
-class VideoDecodeThread(
-    private val extractor: MediaExtractor,
-    private val trackIndex: Int
-) : Thread() {
+class AVPlayer(private val extractorSupplier: () -> MediaExtractor) {
 
     private lateinit var surface: Surface
 
@@ -69,26 +55,35 @@ class VideoDecodeThread(
         this.surface = surface
     }
 
-    override fun run() {
-        extractor.selectTrack(trackIndex)
+    fun start() {
+        createVideoThread()
+        createAudioThread()
+    }
+
+    private fun createVideoThread() = thread {
+        val extractor = extractorSupplier()
+        val trackIndex = extractor.firstVideoTrack ?: error("")
 
         val format = extractor.getTrackFormat(trackIndex)
-        val mime = format.getString(MediaFormat.KEY_MIME)
-            ?: error("Video track must have the mime type")
+        val mime = format.getString(MediaFormat.KEY_MIME) ?: error("")
 
         val decoder = MediaCodec.createDecoderByType(mime).apply {
             configure(format, surface, null, 0)
             start()
         }
 
-        doExtract(extractor, decoder)
+        extractor.selectTrack(trackIndex)
 
-        decoder.stop()
-        decoder.release()
-        extractor.release()
+        try {
+            doVideoExtract(extractor, decoder)
+        } finally {
+            decoder.stop()
+            decoder.release()
+            extractor.release()
+        }
     }
 
-    private fun doExtract(extractor: MediaExtractor, decoder: MediaCodec) {
+    private fun doVideoExtract(extractor: MediaExtractor, decoder: MediaCodec) {
         val info = MediaCodec.BufferInfo()
 
         var inEos = false
@@ -132,19 +127,13 @@ class VideoDecodeThread(
             }
         }
     }
-}
 
-class AudioDecodeThread(
-    private val extractor: MediaExtractor,
-    private val trackIndex: Int
-) : Thread() {
-
-    override fun run() {
-        extractor.selectTrack(trackIndex)
+    private fun createAudioThread() = thread {
+        val extractor = extractorSupplier()
+        val trackIndex = extractor.firstAudioTrack ?: error("")
 
         val format = extractor.getTrackFormat(trackIndex)
-        val mime = format.getString(MediaFormat.KEY_MIME)
-            ?: error("Audio track must have the mime type")
+        val mime = format.getString(MediaFormat.KEY_MIME) ?: error("")
         val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
         val channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
         val channelMask = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
@@ -168,17 +157,20 @@ class AudioDecodeThread(
             .build()
 
         audioTrack.play()
+        extractor.selectTrack(trackIndex)
 
-        doExtract(extractor, decoder, audioTrack)
-
-        decoder.stop()
-        decoder.release()
-        extractor.release()
-        audioTrack.stop()
-        audioTrack.release()
+        try {
+            doAudioExtract(extractor, decoder, audioTrack)
+        } finally {
+            decoder.stop()
+            decoder.release()
+            extractor.release()
+            audioTrack.stop()
+            audioTrack.release()
+        }
     }
 
-    private fun doExtract(extractor: MediaExtractor, decoder: MediaCodec, audioTrack: AudioTrack) {
+    private fun doAudioExtract(extractor: MediaExtractor, decoder: MediaCodec, audioTrack: AudioTrack) {
         val info = MediaCodec.BufferInfo()
 
         var inEos = false

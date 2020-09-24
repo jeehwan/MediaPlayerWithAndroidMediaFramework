@@ -7,6 +7,7 @@ import android.view.Surface
 import android.view.TextureView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.android.synthetic.main.activity_main.*
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 // http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4
@@ -89,6 +90,8 @@ class AVPlayer(private val extractorSupplier: () -> MediaExtractor) {
         var inEos = false
         var outEos = false
 
+        var startTimeUs = -1L
+
         while (!outEos) {
             if (!inEos) {
                 when (val inputIndex = decoder.dequeueInputBuffer(TIMEOUT_US)) {
@@ -116,6 +119,18 @@ class AVPlayer(private val extractorSupplier: () -> MediaExtractor) {
                             decoder.releaseOutputBuffer(outputIndex, false)
                             outEos = true
                         } else {
+                            val curTimeUs = System.nanoTime() / 1000L
+                            if (startTimeUs < 0) {
+                                startTimeUs = curTimeUs
+                            } else {
+                                val sleepTimeUs = info.presentationTimeUs - (curTimeUs - startTimeUs)
+                                if (sleepTimeUs > 0) {
+                                    TimeUnit.MICROSECONDS.sleep(sleepTimeUs)
+                                } else {
+                                    // TODO
+                                }
+                            }
+
                             decoder.releaseOutputBuffer(outputIndex, true)
                         }
                     }
@@ -129,6 +144,8 @@ class AVPlayer(private val extractorSupplier: () -> MediaExtractor) {
     }
 
     private fun createAudioThread() = thread {
+        TimeUnit.SECONDS.sleep(1)  // this will corrupt a/v sync
+
         val extractor = extractorSupplier()
         val trackIndex = extractor.firstAudioTrack ?: error("")
 

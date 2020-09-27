@@ -13,10 +13,7 @@ import androidx.appcompat.app.AppCompatActivity
 import kotlinx.android.synthetic.main.activity_main.*
 import java.nio.ByteBuffer
 import java.util.*
-import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.CyclicBarrier
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.*
 import kotlin.math.max
 import kotlin.math.min
 
@@ -367,11 +364,12 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
 
     private fun postRenderAudio(audioFrame: AudioFrame, delayMillis: Long) {
         audioRenderHandler.postDelayed({
+            Log.d("TEST", "[${SystemClock.uptimeMillis() - startTimeMs}] audio render ${audioFrame.ptsUs / 1000}, ${audioFrame.bufferId}")
+
             if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
                 audioTrack.play()
             }
 
-            Log.d("TEST", "[${SystemClock.uptimeMillis() - startTimeMs}] audio render ${audioFrame.ptsUs / 1000}, ${audioFrame.bufferId}")
             val size = audioFrame.data.remaining()
             audioTrack.write(audioFrame.data, size, AudioTrack.WRITE_BLOCKING)
 
@@ -384,6 +382,8 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
             if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
                 audioTrack.play()
             }
+
+            Log.d("TEST", "[${SystemClock.uptimeMillis() - startTimeMs}] audio render ${audioFrame.ptsUs / 1000}, ${audioFrame.bufferId}")
 
             val size = audioFrame.data.remaining()
             audioTrack.write(audioFrame.data, size, AudioTrack.WRITE_BLOCKING)
@@ -401,6 +401,7 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
 
     private fun postRenderVideoAtTime(videoFrame: VideoFrame, uptimeMillis: Long) {
         videoRenderHandler.postAtTime({
+            Log.d("TEST", "[${SystemClock.uptimeMillis() - startTimeMs}] video render ${videoFrame.ptsUs / 1000}, ${videoFrame.bufferId}")
             videoDecoder.releaseOutputBuffer(videoFrame.bufferId, true)
         }, uptimeMillis)
     }
@@ -417,10 +418,15 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
         postSyncAudioVideo(0)
     }
 
+    private fun getClockTimeMillis(): Long =
+        if (startTimeMs < 0) -1L else SystemClock.uptimeMillis() - startTimeMs
+
+    private fun getCurrentTimeMillis(): Long = SystemClock.uptimeMillis()
+
+    private fun getStartTimeMillis(): Long = startTimeMs
+
     private fun postSyncAudioVideo(delayMillis: Long) {
         syncHandler.postDelayed({
-            syncHandler.removeCallbacksAndMessages(null)
-
             val curTimeMs = SystemClock.uptimeMillis()
 
             val audioFrame: AudioFrame? = audioFrameQueue.peek()
@@ -430,7 +436,7 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
                 return@postDelayed
             }
 
-            Log.d("TEST", "postSyncAudioVideo: audio=$audioFrame, video=$videoFrame")
+//            Log.d("TEST", "postSyncAudioVideo: audio=$audioFrame, video=$videoFrame")
 
             if (startTimeMs < 0) {
                 if (audioFrame == null || videoFrame == null) {
@@ -439,20 +445,22 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
 
                 val startPtsUs = min(audioFrame.ptsUs, videoFrame.ptsUs)
                 startTimeMs = curTimeMs - startPtsUs / 1000L
+
+                val audioDelayMs = audioFrame.ptsUs / 1000L - (curTimeMs - startTimeMs)
+                val videoDelayMs = videoFrame.ptsUs / 1000L - (curTimeMs - startTimeMs)
+                Log.d("TEST", "clock=${curTimeMs - startTimeMs}, audio pts=${audioFrame.ptsUs / 1000L}, video pts=${videoFrame.ptsUs / 1000L}, audio delay=$audioDelayMs ms, video delay=$videoDelayMs ms")
             }
 
             if (audioFrame != null) {
-//                val renderTimeMs = startTimeMs + audioFrame.ptsUs / 1000L
-                val delayMs = audioFrame.ptsUs / 1000L - (curTimeMs - startTimeMs)
-                postRenderAudio(audioFrame, delayMs)
+                val renderTimeMs = startTimeMs + audioFrame.ptsUs / 1000L
+                postRenderAudioAtTime(audioFrame, renderTimeMs)
                 audioFrameQueue.remove()
             }
 
             if (videoFrame != null) {
-//                val renderTimeMs = startTimeMs + videoFrame.ptsUs / 1000L
-                val delayMs = videoFrame.ptsUs / 1000L - (curTimeMs - startTimeMs)
-                if (delayMs > 0) {
-                    postRenderVideo(videoFrame , delayMs)
+                val renderTimeMs = startTimeMs + videoFrame.ptsUs / 1000L
+                if (renderTimeMs >= curTimeMs) {
+                    postRenderVideoAtTime(videoFrame, renderTimeMs)
                 } else {
                     videoDecoder.releaseOutputBuffer(videoFrame.bufferId, false)
                 }
@@ -471,25 +479,31 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     fun seekTo(msec: Long, mode: SeekMode) = synchronized(this) {
         val seekPositionUs = min(max(msec, 0), duration) * 1000L
 
+        val barrier = CyclicBarrier(5)
         val latch = CountDownLatch(5)
 
         audioHandler.postAtFrontOfQueue {
+            barrier.await()
             audioHandler.removeCallbacksAndMessages(null)
             latch.countDown()
         }
         videoHandler.postAtFrontOfQueue {
+            barrier.await()
             videoHandler.removeCallbacksAndMessages(null)
             latch.countDown()
         }
         syncHandler.postAtFrontOfQueue {
+            barrier.await()
             syncHandler.removeCallbacksAndMessages(null)
             latch.countDown()
         }
         audioRenderHandler.postAtFrontOfQueue {
+            barrier.await()
             audioRenderHandler.removeCallbacksAndMessages(null)
             latch.countDown()
         }
         videoRenderHandler.postAtFrontOfQueue {
+            barrier.await()
             videoRenderHandler.removeCallbacksAndMessages(null)
             latch.countDown()
         }
@@ -509,8 +523,9 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
             SeekMode.NEXT_SYNC -> MediaExtractor.SEEK_TO_NEXT_SYNC
             else -> MediaExtractor.SEEK_TO_CLOSEST_SYNC
         }
-        audioExtractor.seekTo(seekPositionUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
         videoExtractor.seekTo(seekPositionUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        val sampleTimeUs = videoExtractor.sampleTime
+        audioExtractor.seekTo(sampleTimeUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
 
         startTimeMs = -1L
 

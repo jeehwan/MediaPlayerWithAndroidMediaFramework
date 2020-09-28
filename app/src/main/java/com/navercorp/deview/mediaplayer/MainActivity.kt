@@ -119,8 +119,7 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
 
     enum class SeekMode {
         PREVIOUS_SYNC,
-        NEXT_SYNC,
-        ACCURATE
+        NEXT_SYNC
     }
 
     private val audioExtractor: MediaExtractor
@@ -181,13 +180,15 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
             .build()
     }
 
-    private val audioThread = HandlerThread("AudioThread").apply { start() }
-    private val videoThread = HandlerThread("VideoThread").apply { start() }
+    private val demuxThread = HandlerThread("DemuxThread").apply { start() }
+    private val audioDecodeThread = HandlerThread("AudioDecodeThread").apply { start() }
+    private val videoDecodeThread = HandlerThread("VideoDecodeThread").apply { start() }
     private val syncThread = HandlerThread("SyncThread").apply { start() }
     private val audioRenderThread = HandlerThread("AudioRenderThread").apply { start() }
     private val videoRenderThread = HandlerThread("VideoRenderThread").apply { start() }
-    private val audioHandler = Handler(audioThread.looper)
-    private val videoHandler = Handler(videoThread.looper)
+    private val demuxHandler = Handler(demuxThread.looper)
+    private val audioDecodeHandler = Handler(audioDecodeThread.looper)
+    private val videoDecodeHandler = Handler(videoDecodeThread.looper)
     private val syncHandler = Handler(syncThread.looper)
     private val audioRenderHandler = Handler(audioRenderThread.looper)
     private val videoRenderHandler = Handler(videoRenderThread.looper)
@@ -258,7 +259,7 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     }
 
     private fun postExtractAudio(delayMillis: Long) {
-        audioHandler.postDelayed({
+        demuxHandler.postDelayed({
             if (!audioInEos) {
                 when (val inputIndex = audioDecoder.dequeueInputBuffer(0)) {
                     in 0..Int.MAX_VALUE -> {
@@ -284,7 +285,7 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     }
 
     private fun postDecodeAudio(delayMillis: Long) {
-        audioHandler.postDelayed({
+        audioDecodeHandler.postDelayed({
             if (!audioOutEos) {
                 when (val outputIndex = audioDecoder.dequeueOutputBuffer(audioBufferInfo, 0)) {
                     in 0..Int.MAX_VALUE -> {
@@ -299,6 +300,9 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
                             queueAudio(outputBuffer, outputIndex,
                                 audioBufferInfo.presentationTimeUs)
                         }
+
+                        postDecodeAudio(0)
+                        return@postDelayed
                     }
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
@@ -313,7 +317,7 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     }
 
     private fun postExtractVideo(delayMillis: Long) {
-        videoHandler.postDelayed({
+        demuxHandler.postDelayed({
             if (!videoInEos) {
                 when (val inputIndex = videoDecoder.dequeueInputBuffer(0)) {
                     in 0..Int.MAX_VALUE -> {
@@ -339,7 +343,7 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     }
 
     private fun postDecodeVideo(delayMillis: Long) {
-        videoHandler.postDelayed({
+        videoDecodeHandler.postDelayed({
             if (!videoOutEos) {
                 when (val outputIndex = videoDecoder.dequeueOutputBuffer(videoBufferInfo, 0)) {
                     in 0..Int.MAX_VALUE -> {
@@ -349,6 +353,9 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
                         } else {
                             queueVideo(outputIndex, videoBufferInfo.presentationTimeUs)
                         }
+
+                        postDecodeVideo(0)
+                        return@postDelayed
                     }
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
@@ -364,14 +371,14 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
 
     private fun postRenderAudio(audioFrame: AudioFrame, delayMillis: Long) {
         audioRenderHandler.postDelayed({
-            Log.d("TEST", "[${SystemClock.uptimeMillis() - startTimeMs}] audio render ${audioFrame.ptsUs / 1000}, ${audioFrame.bufferId}")
-
             if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
                 audioTrack.play()
             }
 
+            Log.d("TEST", "[${SystemClock.uptimeMillis() - startTimeMs}] audio render ${audioFrame.ptsUs / 1000}, ${audioFrame.bufferId}")
+
             val size = audioFrame.data.remaining()
-            audioTrack.write(audioFrame.data, size, AudioTrack.WRITE_BLOCKING)
+            audioTrack.write(audioFrame.data, size, AudioTrack.WRITE_NON_BLOCKING)
 
             audioDecoder.releaseOutputBuffer(audioFrame.bufferId, false)
         }, delayMillis)
@@ -386,7 +393,7 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
             Log.d("TEST", "[${SystemClock.uptimeMillis() - startTimeMs}] audio render ${audioFrame.ptsUs / 1000}, ${audioFrame.bufferId}")
 
             val size = audioFrame.data.remaining()
-            audioTrack.write(audioFrame.data, size, AudioTrack.WRITE_BLOCKING)
+            audioTrack.write(audioFrame.data, size, AudioTrack.WRITE_NON_BLOCKING)
 
             audioDecoder.releaseOutputBuffer(audioFrame.bufferId, false)
         }, uptimeMillis)
@@ -407,23 +414,16 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     }
 
     private fun queueAudio(data: ByteBuffer, bufferId: Int, ptsUs: Long) {
-//        Log.d("TEST", "queueAudio: $bufferId, $ptsUs")
+        Log.d("TEST", "queueAudio: $bufferId, $ptsUs")
         audioFrameQueue.add(AudioFrame(data, bufferId, ptsUs))
         postSyncAudioVideo(0)
     }
 
     private fun queueVideo(bufferId: Int, ptsUs: Long) {
-//        Log.d("TEST", "queueVideo: $bufferId, $ptsUs")
+        Log.d("TEST", "queueVideo: $bufferId, $ptsUs")
         videoFrameQueue.add(VideoFrame(bufferId, ptsUs))
         postSyncAudioVideo(0)
     }
-
-    private fun getClockTimeMillis(): Long =
-        if (startTimeMs < 0) -1L else SystemClock.uptimeMillis() - startTimeMs
-
-    private fun getCurrentTimeMillis(): Long = SystemClock.uptimeMillis()
-
-    private fun getStartTimeMillis(): Long = startTimeMs
 
     private fun postSyncAudioVideo(delayMillis: Long) {
         syncHandler.postDelayed({
@@ -479,17 +479,22 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     fun seekTo(msec: Long, mode: SeekMode) = synchronized(this) {
         val seekPositionUs = min(max(msec, 0), duration) * 1000L
 
-        val barrier = CyclicBarrier(5)
-        val latch = CountDownLatch(5)
+        val barrier = CyclicBarrier(6)
+        val latch = CountDownLatch(6)
 
-        audioHandler.postAtFrontOfQueue {
+        demuxHandler.postAtFrontOfQueue {
             barrier.await()
-            audioHandler.removeCallbacksAndMessages(null)
+            demuxHandler.removeCallbacksAndMessages(null)
             latch.countDown()
         }
-        videoHandler.postAtFrontOfQueue {
+        audioDecodeHandler.postAtFrontOfQueue {
             barrier.await()
-            videoHandler.removeCallbacksAndMessages(null)
+            audioDecodeHandler.removeCallbacksAndMessages(null)
+            latch.countDown()
+        }
+        videoDecodeHandler.postAtFrontOfQueue {
+            barrier.await()
+            videoDecodeHandler.removeCallbacksAndMessages(null)
             latch.countDown()
         }
         syncHandler.postAtFrontOfQueue {
@@ -521,11 +526,10 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
         val flag = when (mode) {
             SeekMode.PREVIOUS_SYNC -> MediaExtractor.SEEK_TO_PREVIOUS_SYNC
             SeekMode.NEXT_SYNC -> MediaExtractor.SEEK_TO_NEXT_SYNC
-            else -> MediaExtractor.SEEK_TO_CLOSEST_SYNC
         }
-        videoExtractor.seekTo(seekPositionUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        videoExtractor.seekTo(seekPositionUs, flag)
         val sampleTimeUs = videoExtractor.sampleTime
-        audioExtractor.seekTo(sampleTimeUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        audioExtractor.seekTo(sampleTimeUs, flag)
 
         startTimeMs = -1L
 
@@ -541,14 +545,18 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     }
 
     fun release() = synchronized(this) {
-        val latch = CountDownLatch(5)
+        val latch = CountDownLatch(6)
 
-        audioHandler.postAtFrontOfQueue {
-            audioThread.quit()
+        demuxHandler.postAtFrontOfQueue {
+            demuxThread.quit()
             latch.countDown()
         }
-        videoHandler.postAtFrontOfQueue {
-            videoThread.quit()
+        audioDecodeHandler.postAtFrontOfQueue {
+            audioDecodeThread.quit()
+            latch.countDown()
+        }
+        videoDecodeHandler.postAtFrontOfQueue {
+            videoDecodeThread.quit()
             latch.countDown()
         }
         syncHandler.postAtFrontOfQueue {

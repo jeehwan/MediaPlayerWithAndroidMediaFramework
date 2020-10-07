@@ -5,12 +5,12 @@ import android.media.*
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.view.Surface
 import android.view.TextureView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.android.synthetic.main.activity_main.*
 import java.util.concurrent.TimeUnit
-import kotlin.concurrent.thread
 
 // http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4
 private val MEDIA_FILE = "bbb_sunflower_1080p_30fps_normal.mp4"
@@ -231,20 +231,21 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     private fun postDecodeVideo(delayMillis: Long) {
         videoDecodeHandler.postDelayed({
             if (!videoOutEos) {
-                when (val outputIndex = videoDecoder.dequeueOutputBuffer(videoBufferInfo, 0)) {
+                val info = videoBufferInfo
+                when (val outputIndex = videoDecoder.dequeueOutputBuffer(info, 0)) {
                     in 0..Int.MAX_VALUE -> {
-                        if ((videoBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                             videoDecoder.releaseOutputBuffer(outputIndex, false)
                             videoOutEos = true
                         } else {
-                            val curTimeUs = System.nanoTime() / 1000L
+                            val curTimeUs = SystemClock.uptimeMillis() * 1000L
                             if (startTimeUs < 0) {
                                 startTimeUs = curTimeUs
                             } else {
-                                val sleepTimeUs = videoBufferInfo.presentationTimeUs -
-                                        (curTimeUs - startTimeUs)
-                                if (sleepTimeUs > 0) {
-                                    TimeUnit.MICROSECONDS.sleep(sleepTimeUs)
+                                val curPtsUs = curTimeUs - startTimeUs
+                                val sleepTimeMs = info.presentationTimeUs - curPtsUs
+                                if (sleepTimeMs > 0) {
+                                    TimeUnit.MILLISECONDS.sleep(sleepTimeMs)
                                 } else {
                                     // TODO
                                 }

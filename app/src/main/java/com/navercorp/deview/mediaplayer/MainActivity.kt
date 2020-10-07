@@ -6,11 +6,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import android.util.Log
 import android.view.Surface
 import android.view.TextureView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.android.synthetic.main.activity_main.*
+import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
+import kotlin.math.max
 
 // http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4
 private val MEDIA_FILE = "bbb_sunflower_1080p_30fps_normal.mp4"
@@ -89,9 +92,13 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
     private val demuxThread = HandlerThread("DemuxThread").apply { start() }
     private val audioDecodeThread = HandlerThread("AudioDecodeThread").apply { start() }
     private val videoDecodeThread = HandlerThread("VideoDecodeThread").apply { start() }
+    private val audioRenderThread = HandlerThread("AudioRenderThread").apply { start() }
+    private val videoRenderThread = HandlerThread("VideoRenderThread").apply { start() }
     private val demuxHandler = Handler(demuxThread.looper)
     private val audioDecodeHandler = Handler(audioDecodeThread.looper)
     private val videoDecodeHandler = Handler(videoDecodeThread.looper)
+    private val audioRenderHandler = Handler(audioRenderThread.looper)
+    private val videoRenderHandler = Handler(videoRenderThread.looper)
 
     private fun createDecoder(
         extractor: MediaExtractor,
@@ -181,10 +188,7 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
                             outputBuffer.position(audioBufferInfo.offset)
                             outputBuffer.limit(audioBufferInfo.offset + audioBufferInfo.size)
 
-                            audioTrack.write(outputBuffer, audioBufferInfo.size,
-                                AudioTrack.WRITE_BLOCKING)
-
-                            audioDecoder.releaseOutputBuffer(outputIndex, false)
+                            postRenderAudio(outputIndex, outputBuffer, 0)
                         }
 
                         postDecodeAudio(0)
@@ -199,6 +203,19 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
 
                 postDecodeAudio(TIMEOUT_MS)
             }
+        }, delayMillis)
+    }
+
+    private fun postRenderAudio(bufferId: Int, buffer: ByteBuffer, delayMillis: Long) {
+        audioRenderHandler.postDelayed({
+            if (audioTrack.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                audioTrack.play()
+            }
+
+            val size = buffer.remaining()
+            audioTrack.write(buffer, size, AudioTrack.WRITE_BLOCKING)
+
+            audioDecoder.releaseOutputBuffer(bufferId, false)
         }, delayMillis)
     }
 
@@ -241,17 +258,11 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
                             val curTimeUs = SystemClock.uptimeMillis() * 1000L
                             if (startTimeUs < 0) {
                                 startTimeUs = curTimeUs
-                            } else {
-                                val curPtsUs = curTimeUs - startTimeUs
-                                val sleepTimeMs = info.presentationTimeUs - curPtsUs
-                                if (sleepTimeMs > 0) {
-                                    TimeUnit.MILLISECONDS.sleep(sleepTimeMs)
-                                } else {
-                                    // TODO
-                                }
                             }
+                            val curPtsUs = curTimeUs - startTimeUs
+                            val sleepTimeUs = info.presentationTimeUs - curPtsUs
 
-                            videoDecoder.releaseOutputBuffer(outputIndex, true)
+                            postRenderVideo(outputIndex, max(sleepTimeUs / 1000L, 0L))
                         }
 
                         postDecodeVideo(0)
@@ -266,6 +277,12 @@ class AVPlayer(extractorSupplier: () -> MediaExtractor, surface: Surface) {
 
                 postDecodeVideo(TIMEOUT_MS)
             }
+        }, delayMillis)
+    }
+
+    private fun postRenderVideo(bufferId: Int, delayMillis: Long) {
+        videoRenderHandler.postDelayed({
+            videoDecoder.releaseOutputBuffer(bufferId, true)
         }, delayMillis)
     }
 }

@@ -3,20 +3,44 @@ package com.navercorp.deview.mediaplayer
 import android.graphics.SurfaceTexture
 import android.media.*
 import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
 import android.view.Surface
 import android.view.TextureView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.android.synthetic.main.activity_main.*
+import java.util.concurrent.TimeUnit
 
 // http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4
 private val MEDIA_FILE = "bbb_sunflower_1080p_30fps_normal.mp4"
-private val TIMEOUT_US = 10_000L
+private val TIMEOUT_MS = 10L
 
 class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     private lateinit var view: AutoFitTextureView
-    private lateinit var videoThread: VideoDecodeThread
-    private lateinit var audioThread: AudioDecodeThread
+
+    private lateinit var demuxThread: HandlerThread
+    private lateinit var audioDecodeThread: HandlerThread
+    private lateinit var videoDecodeThread: HandlerThread
+    private lateinit var demuxHandler: Handler
+    private lateinit var audioDecodeHandler: Handler
+    private lateinit var videoDecodeHandler: Handler
+
+    private var audioTrackIndex: Int? = null
+    private lateinit var audioExtractor: MediaExtractor
+    private lateinit var audioDecoder: MediaCodec
+    private lateinit var audioTrack: AudioTrack
+
+    private var videoTrackIndex: Int? = null
+    private lateinit var videoExtractor: MediaExtractor
+    private lateinit var videoDecoder: MediaCodec
+
+    private var audioInEos = false
+    private var audioOutEos = false
+    private var videoInEos = false
+    private var videoOutEos = false
+    private val audioBufferInfo = MediaCodec.BufferInfo()
+    private val videoBufferInfo = MediaCodec.BufferInfo()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -25,23 +49,6 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         view = textureView
         view.setAspectRatio(16, 9)
         view.surfaceTextureListener = this
-
-        val afd = assets.openFd(MEDIA_FILE)
-        val extractor = MediaExtractor().apply { setDataSource(afd) }
-
-        val videoTrackIndex = extractor.firstVideoTrack
-            ?: error("This media file doesn't contain any video tracks")
-        val videoExtractor = MediaExtractor().apply { setDataSource(afd) }
-
-        val audioTrackIndex = extractor.firstAudioTrack
-            ?: error("This media file doesn't contain any audio tracks")
-        val audioExtractor = MediaExtractor().apply { setDataSource(afd) }
-
-        afd.close()
-        extractor.release()
-
-        audioThread = AudioDecodeThread(audioExtractor, audioTrackIndex)
-        videoThread = VideoDecodeThread(videoExtractor, videoTrackIndex)
     }
 
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
@@ -51,114 +58,71 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-        videoThread.setSurface(Surface(surface))
-        videoThread.start()
-        audioThread.start()
-    }
-
-}
-
-class VideoDecodeThread(
-    private val extractor: MediaExtractor,
-    private val trackIndex: Int
-) : Thread() {
-
-    private lateinit var surface: Surface
-
-    fun setSurface(surface: Surface) {
-        this.surface = surface
-    }
-
-    override fun run() {
-        extractor.selectTrack(trackIndex)
-
-        val format = extractor.getTrackFormat(trackIndex)
-        val mime = format.getString(MediaFormat.KEY_MIME)
-            ?: error("Video track must have the mime type")
-
-        val decoder = MediaCodec.createDecoderByType(mime).apply {
-            configure(format, surface, null, 0)
-            start()
+        val createExtractor = {
+            assets.openFd(MEDIA_FILE).use {
+                MediaExtractor().apply { setDataSource(it) }
+            }
         }
 
-        doExtract(extractor, decoder)
-
-        decoder.stop()
-        decoder.release()
+        val extractor = createExtractor()
+        audioTrackIndex = extractor.firstAudioTrack
+        videoTrackIndex = extractor.firstVideoTrack
         extractor.release()
+
+        if (audioTrackIndex == null || videoTrackIndex == null) {
+            error("We need both audio and video")
+        }
+
+        audioExtractor = createExtractor().apply { selectTrack(audioTrackIndex!!) }
+        videoExtractor = createExtractor().apply { selectTrack(videoTrackIndex!!) }
+
+        audioDecoder = createDecoder(audioExtractor, audioTrackIndex!!)
+        videoDecoder = createDecoder(videoExtractor, videoTrackIndex!!, Surface(surface))
+
+        audioTrack = createAudioTrack(audioExtractor.getTrackFormat(audioTrackIndex!!))
+
+        demuxThread = HandlerThread("DemuxThread").apply { start() }
+        audioDecodeThread = HandlerThread("AudioDecodeThread").apply { start() }
+        videoDecodeThread = HandlerThread("VideoDecodeThread").apply { start() }
+        demuxHandler = Handler(demuxThread.looper)
+        audioDecodeHandler = Handler(audioDecodeThread.looper)
+        videoDecodeHandler = Handler(videoDecodeThread.looper)
+
+        audioDecoder.start()
+        videoDecoder.start()
+        audioTrack.play()
+
+        postExtractAudio(0)
+        postExtractVideo(0)
+        postDecodeAudio(0)
+        postDecodeVideo(0)
     }
 
-    private fun doExtract(extractor: MediaExtractor, decoder: MediaCodec) {
-        val info = MediaCodec.BufferInfo()
+    private fun createDecoder(
+        extractor: MediaExtractor,
+        trackIndex: Int,
+        surface: Surface? = null
+    ): MediaCodec{
+        val format = extractor.getTrackFormat(trackIndex)
+        val mime = format.getString(MediaFormat.KEY_MIME)!!
 
-        var inEos = false
-        var outEos = false
-
-        while (!outEos) {
-            if (!inEos) {
-                when (val inputIndex = decoder.dequeueInputBuffer(TIMEOUT_US)) {
-                    in 0..Int.MAX_VALUE -> {
-                        val inputBuffer = decoder.getInputBuffer(inputIndex)!!
-                        val chunkSize = extractor.readSampleData(inputBuffer, 0)
-                        if (chunkSize < 0) {
-                            decoder.queueInputBuffer(inputIndex, 0, 0, -1,
-                                MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            inEos = true
-                        } else {
-                            val sampleTimeUs = extractor.sampleTime
-                            decoder.queueInputBuffer(inputIndex, 0, chunkSize, sampleTimeUs, 0)
-                            extractor.advance()
-                        }
-                    }
-                    else -> Unit
-                }
-            }
-
-            if (!outEos) {
-                when (val outputIndex = decoder.dequeueOutputBuffer(info, TIMEOUT_US)) {
-                    in 0..Int.MAX_VALUE -> {
-                        if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            decoder.releaseOutputBuffer(outputIndex, false)
-                            outEos = true
-                        } else {
-                            decoder.releaseOutputBuffer(outputIndex, true)
-                        }
-                    }
-                    MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
-                    MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
-                    else -> error("unexpected result from decoder.dequeueOutputBuffer: $outputIndex")
-                }
-            }
+        return MediaCodec.createDecoderByType(mime).apply {
+            configure(format, surface, null, 0)
         }
     }
-}
 
-class AudioDecodeThread(
-    private val extractor: MediaExtractor,
-    private val trackIndex: Int
-) : Thread() {
-
-    override fun run() {
-        extractor.selectTrack(trackIndex)
-
-        val format = extractor.getTrackFormat(trackIndex)
-        val mime = format.getString(MediaFormat.KEY_MIME)
-            ?: error("Audio track must have the mime type")
+    private fun createAudioTrack(format: MediaFormat): AudioTrack {
         val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
         val channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
         val channelMask = when (channels) {
             1 -> AudioFormat.CHANNEL_OUT_MONO
             2 -> AudioFormat.CHANNEL_OUT_STEREO
-            else -> error("Android doesn't support $channels channels")
+            else -> error("AudioTrack doesn't support $channels channels")
         }
+        val minBufferSize = AudioTrack.getMinBufferSize(
+            sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
 
-        val decoder = MediaCodec.createDecoderByType(mime).apply {
-            configure(format, null, null, 0)
-            start()
-        }
-
-        val audioTrack = AudioTrack.Builder()
+        return AudioTrack.Builder()
             .setAudioAttributes(AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .build())
@@ -168,67 +132,121 @@ class AudioDecodeThread(
                 .setChannelMask(channelMask)
                 .build())
             .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(1024 * 100)
+            .setBufferSizeInBytes(minBufferSize * 10)
             .build()
-
-        audioTrack.play()
-
-        doExtract(extractor, decoder, audioTrack)
-
-        decoder.stop()
-        decoder.release()
-        extractor.release()
-        audioTrack.stop()
-        audioTrack.release()
     }
 
-    private fun doExtract(extractor: MediaExtractor, decoder: MediaCodec, audioTrack: AudioTrack) {
-        val info = MediaCodec.BufferInfo()
-
-        var inEos = false
-        var outEos = false
-
-        while (!outEos) {
-            if (!inEos) {
-                when (val inputIndex = decoder.dequeueInputBuffer(TIMEOUT_US)) {
+    private fun postExtractAudio(delayMillis: Long) {
+        demuxHandler.postDelayed({
+            if (!audioInEos) {
+                when (val inputIndex = audioDecoder.dequeueInputBuffer(0)) {
                     in 0..Int.MAX_VALUE -> {
-                        val inputBuffer = decoder.getInputBuffer(inputIndex)!!
-                        val chunkSize = extractor.readSampleData(inputBuffer, 0)
+                        val inputBuffer = audioDecoder.getInputBuffer(inputIndex)!!
+                        val chunkSize = audioExtractor.readSampleData(inputBuffer, 0)
                         if (chunkSize < 0) {
-                            decoder.queueInputBuffer(inputIndex, 0, 0, -1,
+                            audioDecoder.queueInputBuffer(inputIndex, 0, 0, -1,
                                 MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            inEos = true
+                            audioInEos = true
                         } else {
-                            val sampleTimeUs = extractor.sampleTime
-                            decoder.queueInputBuffer(inputIndex, 0, chunkSize, sampleTimeUs, 0)
-                            extractor.advance()
+                            val sampleTimeUs = audioExtractor.sampleTime
+                            audioDecoder.queueInputBuffer(inputIndex, 0, chunkSize,
+                                sampleTimeUs, 0)
+                            audioExtractor.advance()
                         }
+
+                        postExtractAudio(0)
                     }
-                    else -> Unit
+                    else -> postExtractAudio(TIMEOUT_MS)
                 }
             }
+        }, delayMillis)
+    }
 
-            if (!outEos) {
-                when (val outputIndex = decoder.dequeueOutputBuffer(info, TIMEOUT_US)) {
+    private fun postDecodeAudio(delayMillis: Long) {
+        audioDecodeHandler.postDelayed({
+            if (!audioOutEos) {
+                when (val outputIndex = audioDecoder.dequeueOutputBuffer(audioBufferInfo, 0)) {
                     in 0..Int.MAX_VALUE -> {
-                        if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                            decoder.releaseOutputBuffer(outputIndex, false)
-                            outEos = true
+                        if ((audioBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                            audioDecoder.releaseOutputBuffer(outputIndex, false)
+                            audioOutEos = true
                         } else {
-                            val outputBuffer = decoder.getOutputBuffer(outputIndex)!!
-                            outputBuffer.position(info.offset)
-                            outputBuffer.limit(info.offset + info.size)
-                            audioTrack.write(outputBuffer, info.size, AudioTrack.WRITE_BLOCKING)
-                            decoder.releaseOutputBuffer(outputIndex, false)
+                            val outputBuffer = audioDecoder.getOutputBuffer(outputIndex)!!
+                            outputBuffer.position(audioBufferInfo.offset)
+                            outputBuffer.limit(audioBufferInfo.offset + audioBufferInfo.size)
+
+                            audioTrack.write(outputBuffer, audioBufferInfo.size,
+                                AudioTrack.WRITE_BLOCKING)
+
+                            audioDecoder.releaseOutputBuffer(outputIndex, false)
                         }
+
+                        postDecodeAudio(0)
+                        return@postDelayed
                     }
                     MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
                     MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
-                    else -> error("unexpected result from decoder.dequeueOutputBuffer: $outputIndex")
+                    else -> error("unexpected result from " +
+                            "decoder.dequeueOutputBuffer: $outputIndex")
+                }
+
+                postDecodeAudio(TIMEOUT_MS)
+            }
+        }, delayMillis)
+    }
+
+    private fun postExtractVideo(delayMillis: Long) {
+        demuxHandler.postDelayed({
+            if (!videoInEos) {
+                when (val inputIndex = videoDecoder.dequeueInputBuffer(0)) {
+                    in 0..Int.MAX_VALUE -> {
+                        val inputBuffer = videoDecoder.getInputBuffer(inputIndex)!!
+                        val chunkSize = videoExtractor.readSampleData(inputBuffer, 0)
+                        if (chunkSize < 0) {
+                            videoDecoder.queueInputBuffer(inputIndex, 0, 0, -1,
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            videoInEos = true
+                        } else {
+                            val sampleTimeUs = videoExtractor.sampleTime
+                            videoDecoder.queueInputBuffer(inputIndex, 0, chunkSize,
+                                sampleTimeUs, 0)
+                            videoExtractor.advance()
+                        }
+
+                        postExtractVideo(0)
+                    }
+                    else -> postExtractVideo(TIMEOUT_MS)
                 }
             }
-        }
+        }, delayMillis)
+    }
+
+    private fun postDecodeVideo(delayMillis: Long) {
+        videoDecodeHandler.postDelayed({
+            if (!videoOutEos) {
+                when (val outputIndex = videoDecoder.dequeueOutputBuffer(videoBufferInfo, 0)) {
+                    in 0..Int.MAX_VALUE -> {
+                        if ((videoBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                            videoDecoder.releaseOutputBuffer(outputIndex, false)
+                            videoOutEos = true
+                        } else {
+                            videoDecoder.releaseOutputBuffer(outputIndex, true)
+                        }
+
+                        postDecodeVideo(0)
+                        return@postDelayed
+                    }
+                    MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
+                    MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
+                    else -> error("unexpected result from " +
+                            "decoder.dequeueOutputBuffer: $outputIndex")
+                }
+
+                postDecodeVideo(TIMEOUT_MS)
+            }
+        }, delayMillis)
     }
 }
 

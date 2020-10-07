@@ -147,7 +147,11 @@ class AudioDecodeThread(
             ?: error("Audio track must have the mime type")
         val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
         val channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-        val channelMask = if (channels == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+        val channelMask = when (channels) {
+            1 -> AudioFormat.CHANNEL_OUT_MONO
+            2 -> AudioFormat.CHANNEL_OUT_STEREO
+            else -> error("Android doesn't support $channels channels")
+        }
 
         val decoder = MediaCodec.createDecoderByType(mime).apply {
             configure(format, null, null, 0)

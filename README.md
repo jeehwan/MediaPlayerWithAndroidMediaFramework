@@ -14,6 +14,6 @@ DEVIEW 2020 - **안드로이드 미디어 프레임워크를 활용한 동영상
 ## Prerequisites
 API level 23 이상
 
-샘플 코드를 실행하기 전에 반드시 다음경로에 파일을 다운받아 주세요.
-> $ cd app/src/main/assets
-> $ wget http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4
+샘플 코드를 실행하기 전에 반드시 다음경로에 파일을 다운받아 주세요.<br/>
+> $ cd app/src/main/assets<br/>
+> $ wget http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_1080p_30fps_normal.mp4<br/>
